@@ -1,6 +1,7 @@
 import time
 import requests
 import json
+from pyupbit import Upbit
 
 # ✅ 업비트 API 키 입력
 ACCESS_KEY = "WiGpRlLMnut4VeC4NqfeFTQ2FjdLc1gxYRiT6DOH"
@@ -10,80 +11,81 @@ SECRET_KEY = "jsVpBXDdACwU6SYj2Y6eITjUfLRrEHfwycI6vuv8"
 TELEGRAM_TOKEN = "8025718450:AAHPdi-tgOhY-OqWTV8RvmN_T9betoCwpto"
 TELEGRAM_CHAT_ID = "7752168245"
 
-# ✅ 업비트 API 기본 URL
-UPBIT_URL = "https://api.upbit.com/v1"
+# 📌 업비트 객체 생성
+upbit = Upbit(ACCESS_KEY, SECRET_KEY)
 
-# ✅ 텔레그램 메시지 보내는 함수
+# 📌 텔레그램 메시지 전송 함수
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    requests.post(url, data=data)
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"텔레그램 전송 오류: {e}")
 
-# ✅ 내 계좌 잔고 조회
-def get_balances():
-    headers = {"Authorization": f"Bearer {ACCESS_KEY}"}
-    res = requests.get(UPBIT_URL + "/accounts", headers=headers)
-    return res.json()
-
-# ✅ 현재 가격 조회 함수
-def get_current_price(market):
-    url = f"{UPBIT_URL}/ticker?markets={market}"
-    res = requests.get(url)
-    return res.json()[0]["trade_price"]
-
-# ✅ 시장가 매도 함수
-def sell_market_order(market, volume):
-    headers = {
-        "Authorization": f"Bearer {ACCESS_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "market": market,
-        "side": "ask",
-        "volume": str(volume),
-        "ord_type": "market"
-    }
-    res = requests.post(UPBIT_URL + "/orders", headers=headers, data=json.dumps(data))
-    return res.json()
-
-# ✅ 매수 시 평균 매수가 기록
-buy_prices = {}
-
-# ✅ 초기 잔고 기록 (기준이 될 총자산)
-initial_balances = get_balances()
-initial_total_balance = sum(float(b["balance"]) * get_current_price(b["currency"]) for b in initial_balances if b["currency"] != "KRW")
-
-# ✅ 5초마다 손절 확인
-while True:
-    balances = get_balances()
-    total_balance = 0  # 현재 총자산
-
+# 📌 현재 보유 자산 조회
+def get_total_balance():
+    balances = upbit.get_balances()
+    if isinstance(balances, dict) and "error" in balances:
+        raise Exception(f"API 오류: {balances['error']}") 
+    
+    total_balance = 0
     for b in balances:
-        if b["currency"] == "KRW":
-            continue
+        if isinstance(b, dict) and "currency" in b and "balance" in b:
+            if b["currency"] != "KRW":  
+                price = upbit.get_current_price(f"KRW-{b['currency']}")  
+                if price:
+                    total_balance += float(b["balance"]) * price  
+    return total_balance
 
-        market = "KRW-" + b["currency"]
-        volume = float(b["balance"])
-        if volume == 0:
-            continue
+# 📌 시장가 매도 함수 (손절)
+def market_sell(ticker, volume):
+    try:
+        order = upbit.sell_market_order(ticker, volume)  
+        return order
+    except Exception as e:
+        print(f"{ticker} 매도 오류: {e}")
+        return None
 
-        current_price = get_current_price(market)
-        avg_buy_price = float(b["avg_buy_price"])  # 평균 매수가
-        total_balance += volume * current_price
+# 📌 손절 실행 함수
+def auto_cut_loss(loss_threshold=1.0):
+    send_telegram_message("📢 프로그램을 시작합니다.")  # 💡 프로그램 시작 메시지 추가
+    initial_balance = get_total_balance()  
+    print(f"📢 초기 총 잔고: {initial_balance:,.0f} KRW")
+    
+    last_report_time = time.time()  
 
-        # 🔥 손실율 계산
-        loss_percentage = ((current_price - avg_buy_price) / avg_buy_price) * 100
-        loss_amount = (avg_buy_price - current_price) * volume  # 손실 금액
+    while True:
+        time.sleep(10)  
 
-        if loss_percentage <= -1:  # 🔥 -1% 손절
-            sell_market_order(market, volume)
-            msg = f"🔴 {market} 손절!\n"
-            msg += f"💰 손절 금액: {loss_amount:,.0f} KRW\n"
-            msg += f"📉 손실율: {loss_percentage:.2f}%"
-            send_telegram_message(msg)
+        current_balance = get_total_balance()  
+        loss_amount = initial_balance - current_balance  
+        loss_rate = (loss_amount / initial_balance) * 100  
 
-    # 🔥 전체 잔고 대비 손실율 출력
-    total_loss_percentage = ((total_balance - initial_total_balance) / initial_total_balance) * 100
-    print(f"총 잔고 변동율: {total_loss_percentage:.2f}%")
+        print(f"현재 잔고: {current_balance:,.0f} KRW | 손실: {loss_amount:,.0f} KRW ({loss_rate:.2f}%)")
 
-    time.sleep(5)  # 5초마다 체크
+        # 1시간마다 상태 보고
+        if time.time() - last_report_time >= 3600:
+            report_message = f"📊 [상태 보고] \n현재 잔고: {current_balance:,.0f} KRW\n손실: {loss_amount:,.0f} KRW ({loss_rate:.2f}%)"
+            send_telegram_message(report_message)
+            last_report_time = time.time()  
+
+        # 전체 손실률이 기준 이상이면 손절 실행
+        if loss_rate >= loss_threshold:
+            balances = upbit.get_balances()
+            for b in balances:
+                if "currency" in b and "balance" in b and b["currency"] != "KRW":
+                    ticker = f"KRW-{b['currency']}"
+                    volume = float(b["balance"])
+                    if volume > 0:
+                        market_sell(ticker, volume)  
+                        message = f"🚨 [손절] {ticker} \n손실금액: {loss_amount:,.0f} KRW ({loss_rate:.2f}%)"
+                        send_telegram_message(message)  
+                        print(message)
+
+            print("✅ 모든 자산 손절 완료. 프로그램 종료.")
+            break
+
+# ✅ 프로그램 실행
+if __name__ == "__main__":
+    auto_cut_loss(loss_threshold=1.0)  
